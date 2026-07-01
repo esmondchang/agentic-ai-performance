@@ -17,6 +17,7 @@ import concurrent.futures
 import json
 import statistics
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -75,8 +76,15 @@ def run_performance_test(
         f"concurrency={concurrency}"
     )
 
-    def invoke_workflow(run_number: int, phase: str) -> dict[str, Any]:
+    def invoke_workflow(
+        run_number: int,
+        phase: str,
+        start_event: threading.Event | None = None,
+    ) -> dict[str, Any]:
         workflow = FinancialAgentWorkflow()
+        if start_event:
+            start_event.wait()
+
         started_at = time.perf_counter()
         try:
             result = workflow.analyze(ticker=ticker, query=query)
@@ -123,13 +131,21 @@ def run_performance_test(
             f"warmup   {run_result['elapsed_ms']:>10.2f} ms"
         )
 
+    measured_start_event = threading.Event()
     measured_started_at = time.perf_counter()
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
         futures = [
-            executor.submit(invoke_workflow, request_index + 1, "measured")
+            executor.submit(
+                invoke_workflow,
+                request_index + 1,
+                "measured",
+                measured_start_event,
+            )
             for request_index in range(num_requests)
         ]
+        measured_started_at = time.perf_counter()
+        measured_start_event.set()
 
         for completed_count, future in enumerate(
             concurrent.futures.as_completed(futures),
