@@ -163,7 +163,18 @@ Thought: {scratchpad}"""
             thought, action, action_input, is_final = self._parse_response(response)
 
             if is_final:
-                # Found final answer
+                # Found final answer. Some smaller/local models skip directly to
+                # Final Answer on the first pass; keep that visible in the trace
+                # instead of making the UI look like reasoning failed.
+                if not self.reasoning_trace:
+                    self.reasoning_trace.append(
+                        ReActStep(
+                            thought or "Provided a final answer directly.",
+                            "final_answer",
+                            action_input,
+                            "Completed without calling an external tool."
+                        )
+                    )
                 if self.verbose:
                     print(f"\n✅ Final Answer: {action_input}")
                 return action_input, self.reasoning_trace
@@ -210,17 +221,18 @@ Thought: {scratchpad}"""
         # Clean response
         response = response.strip()
 
-        # Check for final answer
-        if "Final Answer:" in response:
-            parts = response.split("Final Answer:")
-            thought = parts[0].strip()
-            final_answer = parts[1].strip()
+        # Check for final answer. Be tolerant of capitalization/spacing because
+        # local models often vary this label even when prompted strictly.
+        final_match = re.search(r"Final\s*Answer\s*:\s*(.+)", response, re.IGNORECASE | re.DOTALL)
+        if final_match:
+            thought = response[:final_match.start()].strip()
+            final_answer = final_match.group(1).strip()
             return thought, "final_answer", final_answer, True
 
         # Parse thought, action, and action input
-        thought_match = re.search(r"Thought:\s*(.+?)(?=Action:|$)", response, re.DOTALL)
-        action_match = re.search(r"Action:\s*(.+?)(?=Action Input:|$)", response, re.DOTALL)
-        input_match = re.search(r"Action Input:\s*(.+?)(?=Observation:|$)", response, re.DOTALL)
+        thought_match = re.search(r"Thought\s*:\s*(.+?)(?=Action\s*:|$)", response, re.IGNORECASE | re.DOTALL)
+        action_match = re.search(r"Action\s*:\s*(.+?)(?=Action\s*Input\s*:|$)", response, re.IGNORECASE | re.DOTALL)
+        input_match = re.search(r"Action\s*Input\s*:\s*(.+?)(?=Observation\s*:|$)", response, re.IGNORECASE | re.DOTALL)
 
         thought = thought_match.group(1).strip() if thought_match else "Thinking..."
         action = action_match.group(1).strip() if action_match else "unknown"
