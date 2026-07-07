@@ -236,14 +236,19 @@ class AgenticAIDemo:
 
             if st.button("📥 Load Financial Documents", key="load_docs"):
                 with st.spinner("Loading documents..."):
-                    count = rag.load_financial_documents(ticker)
-                    st.success(f"Loaded {count} document chunks")
-                    st.session_state.rag_docs_loaded = ticker
+                    try:
+                        count = rag.load_financial_documents(ticker)
+                        st.success(f"Loaded {count} live document chunks")
+                        st.session_state.rag_docs_loaded = ticker
+                        st.session_state.pop("rag_last_response", None)
+                        st.session_state.pop("rag_last_docs", None)
 
-                    # Show statistics
-                    stats = rag.get_statistics()
-                    st.session_state.rag_stats = stats
-                    st.json(stats)
+                        # Show statistics
+                        stats = rag.get_statistics()
+                        st.session_state.rag_stats = stats
+                        st.json(stats)
+                    except Exception as e:
+                        st.error(f"Could not load live internet data for {ticker}: {e}")
 
             # Show cached loading status
             elif 'rag_docs_loaded' in st.session_state:
@@ -521,24 +526,41 @@ class AgenticAIDemo:
                         "sentiment_trend": "improving"
                     }
 
-                    # Generate mock RAG documents
-                    retrieved_documents = [
-                        {
-                            "content": f"{analysis_ticker} reported strong Q3 2024 earnings with revenue up 15% YoY. The company exceeded analyst expectations...",
-                            "metadata": {"source": "10-K Filing", "date": "2024-10-15", "type": "SEC Filing"},
-                            "relevance_score": 0.92
-                        },
-                        {
-                            "content": f"Analysts maintain a positive outlook on {analysis_ticker} with an average price target of ${market_data['price'] * 1.15:.2f}...",
-                            "metadata": {"source": "Analyst Report", "date": "2024-11-01", "type": "Research"},
-                            "relevance_score": 0.87
-                        },
-                        {
-                            "content": f"{analysis_ticker} announced strategic partnership for AI integration, expected to drive growth in 2025...",
-                            "metadata": {"source": "Press Release", "date": "2024-10-28", "type": "News"},
-                            "relevance_score": 0.85
-                        }
-                    ]
+                    # Load current RAG context from live financial/news data.
+                    retrieved_documents = []
+                    try:
+                        st.session_state.rag_engine.load_financial_documents(analysis_ticker)
+                        docs_with_scores = st.session_state.rag_engine.retrieve_with_scores(
+                            analysis_query or f"latest investment outlook for {analysis_ticker}",
+                            k=5
+                        )
+                        retrieved_documents = [
+                            {
+                                "content": doc.page_content,
+                                "metadata": doc.metadata,
+                                "relevance_score": score
+                            }
+                            for doc, score in docs_with_scores
+                        ]
+                    except Exception as rag_error:
+                        retrieved_documents = [
+                            {
+                                "content": f"""
+                                Live RAG retrieval was unavailable for {analysis_ticker}.
+                                Current market data from yfinance during this run:
+                                Price: ${market_data['price']:.2f}
+                                Market Cap: ${market_data['market_cap']:,.0f}
+                                P/E Ratio: {market_data['pe_ratio']:.2f}
+                                Error: {rag_error}
+                                """,
+                                "metadata": {
+                                    "source": "runtime_yfinance_market_data",
+                                    "type": "fallback_market_snapshot",
+                                    "is_live": True
+                                },
+                                "relevance_score": 1.0
+                            }
+                        ]
 
                     # Generate mock reasoning trace
                     reasoning_trace = [

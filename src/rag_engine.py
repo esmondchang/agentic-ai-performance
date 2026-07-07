@@ -10,6 +10,7 @@ from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
 import os
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 from langchain_ollama import OllamaLLM as Ollama
@@ -110,21 +111,14 @@ class RAGEngine:
             # Create empty FAISS index
             return FAISS.from_texts(["init"], self.embeddings)
 
-    def add_documents(self, documents: List[Dict[str, Any]], source_type: str = "general"):
-        """Add documents to the RAG system
-
-        Args:
-            documents: List of documents with 'content' and 'metadata'
-            source_type: Type of document source
-        """
-        # Convert to Document objects
+    def _prepare_documents(self, documents: List[Dict[str, Any]], source_type: str) -> List[Document]:
+        """Convert raw document dictionaries into chunked LangChain documents."""
         docs = []
         for doc in documents:
             content = doc.get("content", "")
             metadata = doc.get("metadata", {})
             metadata["source_type"] = source_type
 
-            # Split into chunks
             chunks = self.text_splitter.split_text(content)
 
             for i, chunk in enumerate(chunks):
@@ -137,29 +131,224 @@ class RAGEngine:
                     metadata=chunk_metadata
                 ))
 
-        # Add to vector store
-        self.vector_store.add_documents(docs)
+        return docs
 
-        # Track source
+    def _track_documents(self, docs: List[Document], source_type: str, replace: bool = False):
+        """Track in-memory source statistics for loaded documents."""
+        if replace:
+            self.document_sources = {source_type: []}
+        elif source_type not in self.document_sources:
+            self.document_sources[source_type] = []
+
         self.document_sources[source_type].extend(docs)
 
-        # Persist FAISS index
+    def _persist_vector_store(self):
+        """Persist FAISS index if persistence is enabled."""
         if self.persist_directory:
             index_path = os.path.join(self.persist_directory, "faiss_index")
             self.vector_store.save_local(index_path)
 
+    def add_documents(self, documents: List[Dict[str, Any]], source_type: str = "general"):
+        """Add documents to the RAG system.
+
+        Args:
+            documents: List of documents with 'content' and 'metadata'
+            source_type: Type of document source
+        """
+        docs = self._prepare_documents(documents, source_type)
+
+        # Add to vector store
+        self.vector_store.add_documents(docs)
+
+        self._track_documents(docs, source_type)
+        self._persist_vector_store()
+
+        return len(docs)
+
+    def replace_documents(self, documents: List[Dict[str, Any]], source_type: str = "general"):
+        """Replace the current RAG index with a fresh document set."""
+        docs = self._prepare_documents(documents, source_type)
+
+        if not docs:
+            raise ValueError("Cannot replace RAG index with zero documents")
+
+        texts = [doc.page_content for doc in docs]
+        metadatas = [doc.metadata for doc in docs]
+        self.vector_store = FAISS.from_texts(texts, self.embeddings, metadatas=metadatas)
+
+        self._track_documents(docs, source_type, replace=True)
+        self._persist_vector_store()
+
         return len(docs)
 
     def load_financial_documents(self, ticker: str = "AAPL"):
-        """Load financial documents for a company (demonstration)"""
+        """Load current financial documents for a company.
 
-        # In a real implementation, this would fetch actual documents
-        # Here we create sample documents for demonstration
+        The loader fetches live market/profile/news data from yfinance and
+        replaces the current RAG index so old sample chunks cannot be retrieved.
+        """
+        live_docs = self.fetch_latest_financial_documents(ticker)
+        if not live_docs:
+            raise RuntimeError(
+                f"Could not load live RAG documents for {ticker}. "
+                "Check internet access or try again later."
+            )
+
+        count = self.replace_documents(live_docs, "live_financial_data")
+        print(f"✅ Loaded {count} live document chunks for {ticker}")
+        return count
+
+    def fetch_latest_financial_documents(self, ticker: str = "AAPL") -> List[Dict[str, Any]]:
+        """Fetch current quote, profile, ratio, and news documents for RAG."""
+        import yfinance as yf
+
+        ticker = ticker.strip().upper()
+        fetched_at = datetime.now(timezone.utc).isoformat()
+        documents: List[Dict[str, Any]] = []
+
+        try:
+            stock = yf.Ticker(ticker)
+            info = stock.info or {}
+
+            try:
+                fast_info = stock.fast_info
+            except Exception:
+                fast_info = {}
+
+            def fast_value(*keys):
+                for key in keys:
+                    try:
+                        value = getattr(fast_info, key)
+                        if value not in (None, "", "N/A"):
+                            return value
+                    except Exception:
+                        pass
+                    try:
+                        value = fast_info[key]
+                        if value not in (None, "", "N/A"):
+                            return value
+                    except Exception:
+                        pass
+                return None
+
+            price = (
+                fast_value("last_price", "lastPrice", "regular_market_price", "regularMarketPrice")
+                or info.get("currentPrice")
+                or info.get("regularMarketPrice")
+            )
+            news_items = stock.news or []
+
+            has_quote_or_profile = any([
+                price is not None,
+                info.get("longName"),
+                info.get("marketCap"),
+                info.get("trailingPE"),
+            ])
+
+            if not has_quote_or_profile and not news_items:
+                return []
+
+            documents.append({
+                "content": f"""
+                Latest market snapshot for {ticker}
+
+                Fetched at: {fetched_at}
+                Company: {info.get('longName', ticker)}
+                Sector: {info.get('sector', 'N/A')}
+                Industry: {info.get('industry', 'N/A')}
+                Current price: {price if price is not None else 'N/A'}
+                Previous close: {fast_value('previous_close', 'previousClose') or info.get('previousClose', 'N/A')}
+                Market cap: {info.get('marketCap', 'N/A')}
+                52 week high: {info.get('fiftyTwoWeekHigh', 'N/A')}
+                52 week low: {info.get('fiftyTwoWeekLow', 'N/A')}
+                Volume: {fast_value('last_volume', 'lastVolume') or info.get('volume', 'N/A')}
+
+                This document was fetched from Yahoo Finance through yfinance at runtime.
+                """,
+                "metadata": {
+                    "ticker": ticker,
+                    "document_type": "market_snapshot",
+                    "source": "yfinance",
+                    "fetched_at": fetched_at,
+                    "is_live": True
+                }
+            })
+
+            documents.append({
+                "content": f"""
+                Latest valuation and profitability metrics for {ticker}
+
+                Fetched at: {fetched_at}
+                Trailing P/E: {info.get('trailingPE', 'N/A')}
+                Forward P/E: {info.get('forwardPE', 'N/A')}
+                PEG ratio: {info.get('pegRatio', 'N/A')}
+                Price to book: {info.get('priceToBook', 'N/A')}
+                Trailing EPS: {info.get('trailingEps', 'N/A')}
+                Forward EPS: {info.get('forwardEps', 'N/A')}
+                Profit margin: {info.get('profitMargins', 'N/A')}
+                Return on equity: {info.get('returnOnEquity', 'N/A')}
+                Analyst recommendation: {info.get('recommendationKey', 'N/A')}
+                Target mean price: {info.get('targetMeanPrice', 'N/A')}
+
+                These metrics came from Yahoo Finance via yfinance and may be delayed.
+                """,
+                "metadata": {
+                    "ticker": ticker,
+                    "document_type": "valuation_metrics",
+                    "source": "yfinance",
+                    "fetched_at": fetched_at,
+                    "is_live": True
+                }
+            })
+
+            for i, item in enumerate(news_items[:8], 1):
+                title = item.get("title") or "Untitled news item"
+                publisher = item.get("publisher") or item.get("provider") or "Yahoo Finance"
+                link = item.get("link", "")
+                published_at = item.get("providerPublishTime")
+                if published_at:
+                    published_at = datetime.fromtimestamp(published_at, tz=timezone.utc).isoformat()
+                else:
+                    published_at = item.get("displayTime") or "N/A"
+
+                summary = item.get("summary") or item.get("description") or ""
+                documents.append({
+                    "content": f"""
+                    Latest news for {ticker}
+
+                    Title: {title}
+                    Publisher: {publisher}
+                    Published at: {published_at}
+                    Link: {link}
+                    Summary: {summary or 'No summary provided by source.'}
+
+                    This news item was fetched from Yahoo Finance through yfinance at runtime.
+                    """,
+                    "metadata": {
+                        "ticker": ticker,
+                        "document_type": "news",
+                        "source": publisher,
+                        "url": link,
+                        "published_at": published_at,
+                        "fetched_at": fetched_at,
+                        "is_live": True,
+                        "rank": i
+                    }
+                })
+
+            return documents
+
+        except Exception as e:
+            print(f"⚠️ Could not fetch live financial documents for {ticker}: {e}")
+            return []
+
+    def _get_sample_financial_documents(self, ticker: str = "AAPL") -> List[Dict[str, Any]]:
+        """Return offline fallback docs for the tutorial."""
 
         sample_docs = [
             {
                 "content": f"""
-                {ticker} Financial Report Q3 2024
+                SAMPLE DATA ONLY - {ticker} Financial Report Q3 2024
 
                 Revenue: $94.9 billion, up 6% year over year
                 Net Income: $22.9 billion
@@ -180,12 +369,13 @@ class RAGEngine:
                     "document_type": "earnings_report",
                     "quarter": "Q3",
                     "year": 2024,
-                    "source": "company_filing"
+                    "source": "sample_company_filing",
+                    "is_live": False
                 }
             },
             {
                 "content": f"""
-                Market Analysis: {ticker} Stock Assessment
+                SAMPLE DATA ONLY - Market Analysis: {ticker} Stock Assessment
 
                 Technical Analysis:
                 - Current RSI: 58 (neutral territory)
@@ -217,12 +407,13 @@ class RAGEngine:
                     "ticker": ticker,
                     "document_type": "analyst_report",
                     "date": "2024-10-15",
-                    "source": "market_research"
+                    "source": "sample_market_research",
+                    "is_live": False
                 }
             },
             {
                 "content": f"""
-                Recent News: {ticker} Announces AI Partnership
+                SAMPLE DATA ONLY - Recent News: {ticker} Announces AI Partnership
 
                 The company announced a strategic partnership with a leading AI research lab
                 to integrate advanced language models into its operating systems.
@@ -243,16 +434,13 @@ class RAGEngine:
                     "document_type": "news",
                     "date": "2024-10-10",
                     "sentiment": "positive",
-                    "source": "financial_news"
+                    "source": "sample_financial_news",
+                    "is_live": False
                 }
             }
         ]
 
-        # Add documents to RAG
-        count = self.add_documents(sample_docs, "financial_reports")
-        print(f"✅ Loaded {count} document chunks for {ticker}")
-
-        return count
+        return sample_docs
 
     def retrieve(self, query: str, k: int = 5, filter: Optional[Dict] = None) -> List[Document]:
         """Retrieve relevant documents
