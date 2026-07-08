@@ -11,6 +11,7 @@ from typing import Dict, Any, List, Optional, TypedDict, Annotated, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 import operator
+import time
 
 from langgraph.graph import StateGraph, END
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, ToolMessage
@@ -50,6 +51,9 @@ class AgentState(TypedDict):
     # ReAct reasoning
     reasoning_trace: List[Dict[str, str]]
 
+    # LangGraph performance telemetry
+    performance_metrics: Dict[str, Any]
+
     # Final outputs
     recommendation: str
     confidence_score: float
@@ -63,24 +67,26 @@ class AgentState(TypedDict):
 class WorkflowNodes:
     """Collection of workflow nodes demonstrating different patterns"""
 
-    def __init__(self):
+    def __init__(self, fast_mode: bool = False):
         """Initialize components"""
         try:
             from src.config import config
         except ModuleNotFoundError:
             from config import config
 
-        # Initialize LLM
-        self.llm = Ollama(
+        self.fast_mode = fast_mode
+
+        # Initialize heavier local-model components only for full mode.
+        self.llm = None if fast_mode else Ollama(
             model=config.analysis_model,
             temperature=0.7
         )
 
         # Initialize RAG engine
-        self.rag_engine = RAGEngine()
+        self.rag_engine = None if fast_mode else RAGEngine()
 
         # Initialize ReAct agent
-        self.react_agent = ReActAgent()
+        self.react_agent = None if fast_mode else ReActAgent()
 
         # Initialize tool registry
         self.tool_registry = ToolRegistry()
@@ -122,6 +128,30 @@ class WorkflowNodes:
         ticker = state["ticker"]
         market_data = state.get("market_data", {})
 
+        if self.fast_mode:
+            pe_ratio = market_data.get("pe_ratio")
+            price = market_data.get("price", "N/A")
+            if isinstance(pe_ratio, (int, float)):
+                valuation = "below" if pe_ratio < 25 else "above"
+                answer = (
+                    f"{ticker} trades at a P/E ratio of {pe_ratio:.2f}, "
+                    f"which is {valuation} the comparison average of 25."
+                )
+            else:
+                answer = f"{ticker} price is {price}. P/E data was not available from the market data tool."
+
+            state["reasoning_trace"] = [
+                {
+                    "thought": "Use collected market data for a fast valuation check.",
+                    "action": "compare_pe_ratio",
+                    "action_input": f"{ticker} vs industry average 25",
+                    "observation": answer,
+                }
+            ]
+            state["recommendation"] = answer
+            state["messages"].append(AIMessage(content=f"Fast ReAct Analysis: {answer}"))
+            return state
+
         # Formulate question for ReAct agent
         question = f"""
         Analyze {ticker} stock with the following data:
@@ -152,6 +182,25 @@ class WorkflowNodes:
 
         ticker = state["ticker"]
         query = state.get("query", f"What is the investment outlook for {ticker}?")
+
+        if self.fast_mode:
+            rag = RAGEngine.__new__(RAGEngine)
+            docs = RAGEngine.fetch_latest_financial_documents(rag, ticker)
+
+            state["retrieved_documents"] = [
+                {
+                    "content": doc.get("content", ""),
+                    "metadata": doc.get("metadata", {}),
+                    "score": 1.0,
+                }
+                for doc in docs[:5]
+            ]
+            state["rag_response"] = (
+                f"Loaded {len(state['retrieved_documents'])} live yfinance documents for {ticker}. "
+                "Fast mode skips embedding search and uses the newest fetched context directly."
+            )
+            state["messages"].append(AIMessage(content=f"Fast RAG Analysis: {state['rag_response']}"))
+            return state
 
         # Load financial documents
         self.rag_engine.load_financial_documents(ticker)
@@ -194,6 +243,22 @@ class WorkflowNodes:
         # Combine news snippets
         news_text = " ".join([r["snippet"] for r in news_results])
         state["news_summary"] = news_text
+
+        if self.fast_mode:
+            positive_terms = ["strong", "growth", "positive", "beat", "innovation", "partnership"]
+            negative_terms = ["risk", "volatility", "competition", "regulatory", "concerns"]
+            lower_news = news_text.lower()
+            positive_count = sum(term in lower_news for term in positive_terms)
+            negative_count = sum(term in lower_news for term in negative_terms)
+            score = max(-1.0, min(1.0, (positive_count - negative_count) / 5))
+
+            state["sentiment_analysis"] = {
+                "overall": score,
+                "bullish_factors": ["Fast keyword scan of available news snippets"],
+                "bearish_factors": ["Full LLM sentiment parsing skipped in fast mode"],
+                "raw_response": news_text,
+            }
+            return state
 
         # Analyze sentiment using LLM
         prompt = f"""
@@ -268,6 +333,37 @@ class WorkflowNodes:
         """Node: Generate final report"""
         print("📝 Generating report...")
 
+        if self.fast_mode:
+            state["report"] = f"""
+# Fast LangGraph Analysis Report for {state['ticker']}
+
+## Market Data
+{state.get('market_data', 'N/A')}
+
+## Technical Analysis
+{state.get('technical_analysis', 'N/A')}
+
+## Sentiment
+{state.get('sentiment_analysis', 'N/A')}
+
+## RAG Context
+{state.get('rag_response', 'N/A')}
+
+## Recommendation
+{state.get('recommendation', 'N/A')}
+
+---
+Generated in fast LangGraph mode. Full LLM synthesis is skipped to keep the browser workflow responsive.
+            """
+            confidence_factors = [
+                0.9 if state.get("market_data") else 0.5,
+                0.8 if state.get("technical_analysis") else 0.5,
+                0.8 if state.get("retrieved_documents") else 0.5,
+                0.8 if state.get("reasoning_trace") else 0.5,
+            ]
+            state["confidence_score"] = sum(confidence_factors) / len(confidence_factors)
+            return state
+
         # Compile all analyses
         report_prompt = f"""
         Generate a comprehensive investment report for {state['ticker']}:
@@ -320,17 +416,57 @@ class WorkflowNodes:
 class FinancialAgentWorkflow:
     """Main workflow orchestrator using LangGraph"""
 
-    def __init__(self):
+    NODE_LABELS = {
+        "collect_market_data": "Collect Market Data",
+        "technical_analysis_node": "Technical Analysis",
+        "sentiment_analysis_node": "Sentiment Analysis",
+        "rag_analysis_node": "RAG Analysis",
+        "react_reasoning": "ReAct Reasoning",
+        "generate_report": "Generate Report",
+    }
+
+    def __init__(self, fast_mode: bool = False):
         """Initialize the workflow"""
+        self.fast_mode = fast_mode
         try:
-            self.nodes = WorkflowNodes()
+            self.nodes = WorkflowNodes(fast_mode=fast_mode)
             self.graph = self._build_graph()
             self.app = self.graph.compile()
         except Exception as e:
             print(f"Warning: Workflow initialization error: {e}")
             # Set defaults if initialization fails
-            self.nodes = WorkflowNodes()
+            self.nodes = WorkflowNodes(fast_mode=fast_mode)
             self.app = None
+
+    def _timed_node(self, node_name: str, node_func):
+        """Wrap a LangGraph node so the state carries per-node timing."""
+        def wrapper(state: AgentState) -> AgentState:
+            started = time.perf_counter()
+            metrics = state.setdefault("performance_metrics", {})
+            node_metrics = metrics.setdefault("nodes", [])
+
+            try:
+                result = node_func(state)
+                status = "success"
+                return result
+            except Exception as e:
+                status = "error"
+                state["error"] = str(e)
+                raise
+            finally:
+                duration_ms = (time.perf_counter() - started) * 1000
+                node_metrics.append({
+                    "node": node_name,
+                    "label": self.NODE_LABELS.get(node_name, node_name),
+                    "duration_ms": round(duration_ms, 2),
+                    "status": status,
+                    "mode": "fast" if self.fast_mode else "full",
+                    "documents": len(state.get("retrieved_documents", [])),
+                    "reasoning_steps": len(state.get("reasoning_trace", [])),
+                    "error": state.get("error"),
+                })
+
+        return wrapper
 
     def _build_graph(self) -> StateGraph:
         """Build the workflow graph
@@ -345,12 +481,12 @@ class FinancialAgentWorkflow:
         workflow = StateGraph(AgentState)
 
         # Add nodes
-        workflow.add_node("collect_market_data", self.nodes.collect_market_data)
-        workflow.add_node("technical_analysis_node", self.nodes.calculate_technical_indicators)
-        workflow.add_node("sentiment_analysis_node", self.nodes.analyze_sentiment)
-        workflow.add_node("rag_analysis_node", self.nodes.perform_rag_analysis)
-        workflow.add_node("react_reasoning", self.nodes.analyze_with_react)
-        workflow.add_node("generate_report", self.nodes.generate_report)
+        workflow.add_node("collect_market_data", self._timed_node("collect_market_data", self.nodes.collect_market_data))
+        workflow.add_node("technical_analysis_node", self._timed_node("technical_analysis_node", self.nodes.calculate_technical_indicators))
+        workflow.add_node("sentiment_analysis_node", self._timed_node("sentiment_analysis_node", self.nodes.analyze_sentiment))
+        workflow.add_node("rag_analysis_node", self._timed_node("rag_analysis_node", self.nodes.perform_rag_analysis))
+        workflow.add_node("react_reasoning", self._timed_node("react_reasoning", self.nodes.analyze_with_react))
+        workflow.add_node("generate_report", self._timed_node("generate_report", self.nodes.generate_report))
 
         # Define the flow
         workflow.set_entry_point("collect_market_data")
@@ -387,7 +523,16 @@ class FinancialAgentWorkflow:
                 "market_data": self._get_simple_market_data(ticker),
                 "report": f"Simple analysis for {ticker}. Please ensure Ollama is running.",
                 "recommendation": "UNABLE TO ANALYZE",
-                "confidence_score": 0.0
+                "confidence_score": 0.0,
+                "performance_metrics": {
+                    "framework": "LangGraph",
+                    "mode": "fast" if self.fast_mode else "full",
+                    "total_duration_ms": 0,
+                    "node_count": 0,
+                    "successful_nodes": 0,
+                    "failed_nodes": 0,
+                    "nodes": [],
+                }
             }
 
         # Initialize state
@@ -404,6 +549,15 @@ class FinancialAgentWorkflow:
             "retrieved_documents": [],
             "rag_response": "",
             "reasoning_trace": [],
+            "performance_metrics": {
+                "framework": "LangGraph",
+                "mode": "fast" if self.fast_mode else "full",
+                "nodes": [],
+                "total_duration_ms": 0,
+                "node_count": 0,
+                "successful_nodes": 0,
+                "failed_nodes": 0,
+            },
             "recommendation": "",
             "confidence_score": 0.0,
             "report": "",
@@ -414,7 +568,25 @@ class FinancialAgentWorkflow:
 
         # Run workflow
         try:
+            started = time.perf_counter()
             final_state = self.app.invoke(initial_state)
+            duration_ms = (time.perf_counter() - started) * 1000
+
+            metrics = final_state.setdefault("performance_metrics", {})
+            nodes = metrics.get("nodes", [])
+            metrics.update({
+                "framework": "LangGraph",
+                "mode": "fast" if self.fast_mode else "full",
+                "total_duration_ms": round(duration_ms, 2),
+                "node_count": len(nodes),
+                "successful_nodes": sum(1 for node in nodes if node.get("status") == "success"),
+                "failed_nodes": sum(1 for node in nodes if node.get("status") == "error"),
+                "documents_retrieved": len(final_state.get("retrieved_documents", [])),
+                "reasoning_steps": len(final_state.get("reasoning_trace", [])),
+                "messages": len(final_state.get("messages", [])),
+                "confidence_score": final_state.get("confidence_score", 0),
+            })
+
             return final_state
 
         except Exception as e:
@@ -423,7 +595,22 @@ class FinancialAgentWorkflow:
                 "ticker": ticker,
                 "report": f"Analysis failed: {str(e)}",
                 "recommendation": "ERROR",
-                "confidence_score": 0.0
+                "confidence_score": 0.0,
+                "performance_metrics": {
+                    "framework": "LangGraph",
+                    "mode": "fast" if self.fast_mode else "full",
+                    "total_duration_ms": round((time.perf_counter() - started) * 1000, 2) if "started" in locals() else 0,
+                    "node_count": len(initial_state.get("performance_metrics", {}).get("nodes", [])),
+                    "successful_nodes": sum(
+                        1 for node in initial_state.get("performance_metrics", {}).get("nodes", [])
+                        if node.get("status") == "success"
+                    ),
+                    "failed_nodes": sum(
+                        1 for node in initial_state.get("performance_metrics", {}).get("nodes", [])
+                        if node.get("status") == "error"
+                    ),
+                    "nodes": initial_state.get("performance_metrics", {}).get("nodes", []),
+                }
             }
 
     def _get_simple_market_data(self, ticker: str) -> Dict[str, Any]:

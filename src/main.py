@@ -11,6 +11,7 @@ import streamlit as st
 import asyncio
 from datetime import datetime
 import json
+import time
 from typing import Dict, Any, List
 
 # Import our components
@@ -22,7 +23,7 @@ from src.workflow import FinancialAgentWorkflow
 
 # Page config
 st.set_page_config(
-    page_title="Agentic AI Tutorial - Ollama",
+    page_title="Agentic AI with SLM",
     page_icon="🤖",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -48,7 +49,7 @@ class AgenticAIDemo:
     def render_sidebar(self):
         """Render the sidebar with configuration and educational content"""
         with st.sidebar:
-            st.title("🎓 Agentic AI Tutorial")
+            st.title("🎓 Agentic AI")
 
             # Model selection
             st.subheader("🤖 Model Configuration")
@@ -428,173 +429,159 @@ class AgenticAIDemo:
             Tools expand agent capabilities!
             """)
 
-    def demonstrate_workflow(self):
-        """Demonstrate complete workflow"""
-        st.header("🔄 Complete Agent Workflow")
+    def run_standard_workflow(self, analysis_ticker: str, analysis_query: str) -> Dict[str, Any]:
+        """Run the full browser workflow without LangGraph orchestration."""
+        performance_nodes = []
+        workflow_started = time.perf_counter()
 
-        col1, col2 = st.columns([2, 1])
+        def timed_step(name: str, func):
+            started = time.perf_counter()
+            try:
+                value = func()
+                status = "success"
+                return value
+            except Exception as e:
+                status = "error"
+                raise
+            finally:
+                performance_nodes.append({
+                    "node": name.lower().replace(" ", "_"),
+                    "label": name,
+                    "duration_ms": round((time.perf_counter() - started) * 1000, 2),
+                    "status": status,
+                    "mode": "no-langgraph",
+                    "documents": 0,
+                    "reasoning_steps": 0,
+                })
 
-        with col1:
-            ticker = st.text_input(
-                "Stock ticker to analyze:",
-                value="AAPL",
-                key="workflow_ticker"
+        def collect_market_data():
+            import yfinance as yf
+
+            stock = yf.Ticker(analysis_ticker)
+            info = stock.info
+            hist = stock.history(period="1mo")
+
+            return {
+                "price": info.get("currentPrice", hist['Close'].iloc[-1] if not hist.empty else 0),
+                "market_cap": info.get("marketCap", 0),
+                "pe_ratio": info.get("trailingPE", 0),
+                "volume": info.get("volume", info.get("regularMarketVolume", 0)),
+            }
+
+        market_data = timed_step("Collect Market Data", collect_market_data)
+
+        def run_ai_analysis():
+            analysis_prompt = f"""
+            Analyze {analysis_ticker} stock:
+            Current Price: ${market_data['price']:.2f}
+            Market Cap: ${market_data['market_cap']:,.0f}
+            P/E Ratio: {market_data['pe_ratio']:.2f}
+
+            Question: {analysis_query}
+
+            Provide investment recommendation with reasoning.
+            """
+
+            from langchain_ollama import OllamaLLM as Ollama
+            llm = Ollama(model="llama3.2:latest", temperature=0.7)
+            return llm.invoke(analysis_prompt)
+
+        recommendation = timed_step("AI Recommendation", run_ai_analysis)
+
+        def calculate_technicals():
+            price = market_data.get("price") or 0
+            return {
+                "rsi": 55.2,
+                "macd": {"value": 1.23, "signal": 0.98, "histogram": 0.25},
+                "sma_20": price * 0.98,
+                "sma_50": price * 0.95,
+                "sma_200": price * 0.92,
+                "volume_trend": "increasing",
+                "support": price * 0.94,
+                "resistance": price * 1.06,
+                "trend": "bullish" if price > price * 0.95 else "bearish"
+            }
+
+        technical_analysis = timed_step("Technical Analysis", calculate_technicals)
+
+        def analyze_sentiment():
+            return {
+                "overall_score": 0.65,
+                "sources": {
+                    "reddit": {"score": 0.7, "posts_analyzed": 150},
+                    "twitter": {"score": 0.6, "posts_analyzed": 500},
+                    "news": {"score": 0.65, "posts_analyzed": 25}
+                },
+                "trending_topics": [
+                    "earnings expectations",
+                    "AI infrastructure demand",
+                    "supply chain concerns"
+                ],
+                "sentiment_trend": "improving"
+            }
+
+        sentiment_analysis = timed_step("Sentiment Analysis", analyze_sentiment)
+
+        def load_rag_context():
+            rag = RAGEngine()
+            rag.load_financial_documents(analysis_ticker)
+            docs_with_scores = rag.retrieve_with_scores(
+                analysis_query or f"latest investment outlook for {analysis_ticker}",
+                k=5
             )
+            return [
+                {
+                    "content": doc.page_content,
+                    "metadata": doc.metadata,
+                    "relevance_score": score
+                }
+                for doc, score in docs_with_scores
+            ]
 
-            query = st.text_area(
-                "Specific question (optional):",
-                value="Should I invest in this stock given current market conditions?",
-                key="workflow_query"
-            )
-
-            if st.button("🚀 Run Complete Analysis", type="primary", key="run_workflow"):
-                # Don't modify widget-linked session state, create separate variables
-                analysis_ticker = ticker
-                analysis_query = query
-
-                # Progress tracking
-                progress = st.progress(0)
-                status = st.empty()
-
-                try:
-                    # Simpler workflow without LangGraph complexity
-                    status.text("📊 Collecting market data...")
-                    progress.progress(20)
-
-                    # Get market data
-                    import yfinance as yf
-                    stock = yf.Ticker(analysis_ticker)
-                    info = stock.info
-                    hist = stock.history(period="1mo")
-
-                    market_data = {
-                        "price": info.get("currentPrice", hist['Close'].iloc[-1] if not hist.empty else 0),
-                        "market_cap": info.get("marketCap", 0),
-                        "pe_ratio": info.get("trailingPE", 0)
-                    }
-
-                    status.text("🤖 Running AI analysis...")
-                    progress.progress(60)
-
-                    # Simple AI analysis using Ollama
-                    if 'rag_engine' not in st.session_state:
-                        st.session_state.rag_engine = RAGEngine()
-
-                    # Generate simple analysis
-                    analysis_prompt = f"""
-                    Analyze {analysis_ticker} stock:
-                    Current Price: ${market_data['price']:.2f}
+        try:
+            retrieved_documents = timed_step("RAG Context", load_rag_context)
+        except Exception as rag_error:
+            retrieved_documents = [
+                {
+                    "content": f"""
+                    Live RAG retrieval was unavailable for {analysis_ticker}.
+                    Current market data from yfinance during this run:
+                    Price: ${market_data['price']:.2f}
                     Market Cap: ${market_data['market_cap']:,.0f}
                     P/E Ratio: {market_data['pe_ratio']:.2f}
+                    Error: {rag_error}
+                    """,
+                    "metadata": {
+                        "source": "runtime_yfinance_market_data",
+                        "type": "fallback_market_snapshot",
+                        "is_live": True
+                    },
+                    "relevance_score": 1.0
+                }
+            ]
 
-                    Question: {analysis_query}
+        def build_reasoning_trace():
+            return [
+                {
+                    "thought": f"I need to analyze {analysis_ticker}'s financial metrics",
+                    "action": "fetch_market_data",
+                    "observation": f"Current P/E of {market_data['pe_ratio']:.1f} vs industry avg of 25"
+                },
+                {
+                    "thought": "Checking technical indicators for trend analysis",
+                    "action": "analyze_technicals",
+                    "observation": f"RSI at {technical_analysis['rsi']:.1f} indicates neutral momentum"
+                },
+                {
+                    "thought": "Evaluating market sentiment",
+                    "action": "analyze_sentiment",
+                    "observation": f"Positive sentiment score of {sentiment_analysis['overall_score']:.2f}"
+                }
+            ]
 
-                    Provide investment recommendation with reasoning.
-                    """
+        reasoning_trace = timed_step("Reasoning", build_reasoning_trace)
 
-                    from langchain_ollama import OllamaLLM as Ollama
-                    llm = Ollama(model="llama3.2:latest", temperature=0.7)
-
-                    recommendation = llm.invoke(analysis_prompt)
-
-                    # Generate mock technical indicators
-                    technical_analysis = {
-                        "rsi": 55.2,
-                        "macd": {"value": 1.23, "signal": 0.98, "histogram": 0.25},
-                        "sma_20": market_data['price'] * 0.98,
-                        "sma_50": market_data['price'] * 0.95,
-                        "sma_200": market_data['price'] * 0.92,
-                        "volume_trend": "increasing",
-                        "support": market_data['price'] * 0.94,
-                        "resistance": market_data['price'] * 1.06,
-                        "trend": "bullish" if market_data['price'] > market_data['price'] * 0.95 else "bearish"
-                    }
-
-                    # Generate mock sentiment data
-                    sentiment_analysis = {
-                        "overall_score": 0.65,
-                        "sources": {
-                            "reddit": {"score": 0.7, "posts_analyzed": 150},
-                            "twitter": {"score": 0.6, "tweets_analyzed": 500},
-                            "news": {"score": 0.65, "articles_analyzed": 25}
-                        },
-                        "trending_topics": [
-                            "earnings beat expectations",
-                            "new product launch",
-                            "supply chain concerns"
-                        ],
-                        "sentiment_trend": "improving"
-                    }
-
-                    # Load current RAG context from live financial/news data.
-                    retrieved_documents = []
-                    try:
-                        st.session_state.rag_engine.load_financial_documents(analysis_ticker)
-                        docs_with_scores = st.session_state.rag_engine.retrieve_with_scores(
-                            analysis_query or f"latest investment outlook for {analysis_ticker}",
-                            k=5
-                        )
-                        retrieved_documents = [
-                            {
-                                "content": doc.page_content,
-                                "metadata": doc.metadata,
-                                "relevance_score": score
-                            }
-                            for doc, score in docs_with_scores
-                        ]
-                    except Exception as rag_error:
-                        retrieved_documents = [
-                            {
-                                "content": f"""
-                                Live RAG retrieval was unavailable for {analysis_ticker}.
-                                Current market data from yfinance during this run:
-                                Price: ${market_data['price']:.2f}
-                                Market Cap: ${market_data['market_cap']:,.0f}
-                                P/E Ratio: {market_data['pe_ratio']:.2f}
-                                Error: {rag_error}
-                                """,
-                                "metadata": {
-                                    "source": "runtime_yfinance_market_data",
-                                    "type": "fallback_market_snapshot",
-                                    "is_live": True
-                                },
-                                "relevance_score": 1.0
-                            }
-                        ]
-
-                    # Generate mock reasoning trace
-                    reasoning_trace = [
-                        {
-                            "thought": f"I need to analyze {analysis_ticker}'s financial metrics",
-                            "action": "fetch_market_data",
-                            "observation": f"Current P/E of {market_data['pe_ratio']:.1f} vs industry avg of 25"
-                        },
-                        {
-                            "thought": "Checking technical indicators for trend analysis",
-                            "action": "analyze_technicals",
-                            "observation": f"RSI at {technical_analysis['rsi']:.1f} indicates neutral momentum"
-                        },
-                        {
-                            "thought": "Evaluating market sentiment",
-                            "action": "analyze_sentiment",
-                            "observation": f"Positive sentiment score of {sentiment_analysis['overall_score']:.2f}"
-                        }
-                    ]
-
-                    progress.progress(100)
-                    status.text("✅ Analysis complete!")
-
-                    # Create comprehensive result
-                    result = {
-                        "ticker": analysis_ticker,
-                        "market_data": market_data,
-                        "recommendation": recommendation,
-                        "confidence_score": 0.75,
-                        "technical_analysis": technical_analysis,
-                        "sentiment_analysis": sentiment_analysis,
-                        "retrieved_documents": retrieved_documents,
-                        "reasoning_trace": reasoning_trace,
-                        "report": f"""
+        report = f"""
 # Analysis Report for {analysis_ticker}
 
 ## Market Data
@@ -617,9 +604,87 @@ class AgenticAIDemo:
 {recommendation}
 
 ---
-*Analysis generated using multiple data sources*
-                        """
-                    }
+Generated by the full workflow without LangGraph orchestration.
+        """
+
+        total_duration_ms = round((time.perf_counter() - workflow_started) * 1000, 2)
+        for node in performance_nodes:
+            if node["label"] == "RAG Context":
+                node["documents"] = len(retrieved_documents)
+            if node["label"] == "Reasoning":
+                node["reasoning_steps"] = len(reasoning_trace)
+
+        return {
+            "ticker": analysis_ticker,
+            "market_data": market_data,
+            "recommendation": recommendation,
+            "confidence_score": 0.75,
+            "technical_analysis": technical_analysis,
+            "sentiment_analysis": sentiment_analysis,
+            "retrieved_documents": retrieved_documents,
+            "reasoning_trace": reasoning_trace,
+            "report": report,
+            "performance_metrics": {
+                "framework": "Standard Python",
+                "mode": "no-langgraph",
+                "total_duration_ms": total_duration_ms,
+                "node_count": len(performance_nodes),
+                "successful_nodes": sum(1 for node in performance_nodes if node.get("status") == "success"),
+                "failed_nodes": sum(1 for node in performance_nodes if node.get("status") == "error"),
+                "documents_retrieved": len(retrieved_documents),
+                "reasoning_steps": len(reasoning_trace),
+                "messages": 0,
+                "nodes": performance_nodes,
+            }
+        }
+
+    def demonstrate_workflow(self):
+        """Demonstrate complete workflow"""
+        st.header("🔄 Complete Agent Workflow")
+
+        col1, col2 = st.columns([2, 1])
+
+        with col1:
+            ticker = st.text_input(
+                "Stock ticker to analyze:",
+                value="AAPL",
+                key="workflow_ticker"
+            )
+
+            query = st.text_area(
+                "Specific question (optional):",
+                value="Should I invest in this stock given current market conditions?",
+                key="workflow_query"
+            )
+
+            full_langgraph = st.checkbox(
+                "Run full LangGraph LLM workflow",
+                value=False,
+                help="Unchecked runs the full browser workflow without LangGraph orchestration."
+            )
+
+            if st.button("🚀 Run Complete Analysis", type="primary", key="run_workflow"):
+                # Don't modify widget-linked session state, create separate variables
+                analysis_ticker = ticker
+                analysis_query = query
+
+                # Progress tracking
+                progress = st.progress(0)
+                status = st.empty()
+
+                try:
+                    workflow_mode = "LangGraph" if full_langgraph else "standard"
+                    status.text(f"🔄 Running {workflow_mode} workflow...")
+                    progress.progress(20)
+
+                    if full_langgraph:
+                        workflow = FinancialAgentWorkflow(fast_mode=False)
+                        result = workflow.analyze(analysis_ticker, analysis_query)
+                    else:
+                        result = self.run_standard_workflow(analysis_ticker, analysis_query)
+
+                    progress.progress(100)
+                    status.text("✅ Analysis complete!")
 
                     # Store result in session state
                     st.session_state.workflow_result = result
@@ -660,13 +725,14 @@ class AgenticAIDemo:
 
                 with metrics_col3:
                     market_data = result.get("market_data", {})
+                    current_price = market_data.get("price") or 0
                     st.metric(
                         "Current Price",
-                        f"${market_data.get('price', 0):.2f}"
+                        f"${current_price:.2f}" if isinstance(current_price, (int, float)) else str(current_price)
                     )
 
                 # Detailed sections
-                tabs = st.tabs(["📝 Report", "🤔 Reasoning", "📚 RAG Context", "📈 Technical", "😊 Sentiment"])
+                tabs = st.tabs(["📝 Report", "🤔 Reasoning", "📚 RAG Context", "📈 Technical", "😊 Sentiment", "⚡ Performance"])
 
                 with tabs[0]:
                     st.markdown(result.get("report", "No report generated"))
@@ -697,8 +763,9 @@ class AgenticAIDemo:
                                     meta = doc.get("metadata", {})
                                     st.write(f"Source: {meta.get('source', 'N/A')}")
                                     st.write(f"Date: {meta.get('date', 'N/A')}")
-                                    if 'relevance_score' in doc:
-                                        st.metric("Relevance", f"{doc['relevance_score']:.2f}")
+                                    relevance = doc.get("relevance_score", doc.get("score"))
+                                    if relevance is not None:
+                                        st.metric("Relevance", f"{relevance:.2f}")
                     else:
                         st.info("No documents retrieved")
 
@@ -712,8 +779,9 @@ class AgenticAIDemo:
                             st.metric("Trend", tech.get('trend', 'N/A').title())
 
                         with col2:
-                            st.metric("Support", f"${tech.get('support', 0):.2f}")
-                            st.metric("Resistance", f"${tech.get('resistance', 0):.2f}")
+                            st.metric("SMA 50", f"${tech.get('sma_50', 0):.2f}")
+                            if "support" in tech:
+                                st.metric("Support", f"${tech.get('support', 0):.2f}")
 
                         with col3:
                             st.metric("SMA 20", f"${tech.get('sma_20', 0):.2f}")
@@ -736,8 +804,9 @@ class AgenticAIDemo:
                     sent = result.get("sentiment_analysis", {})
                     if sent:
                         # Overall sentiment
-                        score = sent.get('overall_score', 0.5)
-                        st.progress(score, text=f"Overall Sentiment: {score:.2f}")
+                        score = sent.get('overall_score', sent.get('overall', 0.5))
+                        progress_score = max(0.0, min(1.0, (score + 1) / 2 if score < 0 else score))
+                        st.progress(progress_score, text=f"Overall Sentiment: {score:.2f}")
                         st.write(f"**Trend**: {sent.get('sentiment_trend', 'stable').title()}")
 
                         # Source breakdown
@@ -760,6 +829,54 @@ class AgenticAIDemo:
                     else:
                         st.info("No sentiment analysis available")
 
+                with tabs[5]:
+                    perf = result.get("performance_metrics", {})
+                    nodes = perf.get("nodes", [])
+
+                    if perf:
+                        metric_cols = st.columns(4)
+                        with metric_cols[0]:
+                            st.metric("Framework", perf.get("framework", "LangGraph"))
+                        with metric_cols[1]:
+                            st.metric("Mode", perf.get("mode", "fast").title())
+                        with metric_cols[2]:
+                            st.metric("Total Duration", f"{perf.get('total_duration_ms', 0):,.0f} ms")
+                        with metric_cols[3]:
+                            st.metric("Nodes", perf.get("node_count", len(nodes)))
+
+                        detail_cols = st.columns(4)
+                        with detail_cols[0]:
+                            st.metric("Success", f"{perf.get('successful_nodes', 0)}/{perf.get('node_count', len(nodes))}")
+                        with detail_cols[1]:
+                            st.metric("Documents", perf.get("documents_retrieved", len(result.get("retrieved_documents", []))))
+                        with detail_cols[2]:
+                            st.metric("Reasoning Steps", perf.get("reasoning_steps", len(result.get("reasoning_trace", []))))
+                        with detail_cols[3]:
+                            st.metric("Messages", perf.get("messages", 0))
+
+                        if nodes:
+                            st.subheader("Workflow Step Timings")
+                            st.dataframe(
+                                [
+                                    {
+                                        "Node": node.get("label", node.get("node", "")),
+                                        "Duration (ms)": node.get("duration_ms", 0),
+                                        "Status": node.get("status", "unknown"),
+                                        "Mode": node.get("mode", perf.get("mode", "fast")),
+                                        "Documents": node.get("documents", 0),
+                                        "Reasoning Steps": node.get("reasoning_steps", 0),
+                                    }
+                                    for node in nodes
+                                ],
+                                use_container_width=True,
+                                hide_index=True,
+                            )
+
+                        if result.get("error") or perf.get("failed_nodes", 0):
+                            st.error(result.get("error", "One or more LangGraph nodes failed."))
+                    else:
+                        st.info("No LangGraph performance data available")
+
         with col2:
             st.info("""
             **Workflow Steps:**
@@ -776,7 +893,7 @@ class AgenticAIDemo:
 
     def run(self):
         """Main application entry point"""
-        st.title("🤖 Agentic AI Tutorial with Ollama")
+        st.title("🤖 Agentic AI with SLM")
         st.markdown("""
         Learn agentic AI patterns with local open-source models!
         This tutorial demonstrates ReAct, RAG, Tools, and Workflows.
